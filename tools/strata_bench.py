@@ -38,7 +38,6 @@ import platform
 import re
 import shutil
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -50,6 +49,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bench_metrics import validated_metrics, finite_nonnegative, measured_median, measured_ratio
 from ab_engine import PROMPTS, long_prompt          # noqa: E402  the same three short questions and word list
 from agent_turns_bench import SYSTEM, TOOLS         # noqa: E402  the same agent system prompt and tool list
 import serve_load                                   # noqa: E402  the burst client for --clients
@@ -107,7 +107,8 @@ def redactor(extra: list[str] = (), key: str = ""):
 
 def redact_obj(obj, red):
     if isinstance(obj, dict):
-        return {red(k) if isinstance(k, str) else k: redact_obj(v, red) for k, v in obj.items()}
+        # Keys define the report schema; only values contain redactable text.
+        return {k: redact_obj(v, red) for k, v in obj.items()}
     if isinstance(obj, list):
         return [redact_obj(v, red) for v in obj]
     return red(obj) if isinstance(obj, str) else obj
@@ -141,6 +142,8 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
                                           **({"Authorization": "Bearer " + key} if key else {})})
     t0 = time.perf_counter()
     first, text, usage, timings, err, pieces = None, [], None, None, None, 0
+    done = False
+    finish = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             for raw in r:
@@ -149,14 +152,24 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
                     continue
                 d = line[5:].strip()
                 if d == "[DONE]":
+                    done = True
                     break
                 try:
                     j = json.loads(d)
                 except ValueError:
+                    err = "invalid JSON in SSE data"
                     continue
                 if j.get("error"):
                     err = str(j["error"])[:300]
                 for ch in j.get("choices") or []:
+                    if ch.get("finish_reason") is not None:
+                        reason = ch["finish_reason"]
+                        if not isinstance(reason, str) or reason not in ("stop", "length", "tool_calls"):
+                            err = "invalid finish_reason"
+                        elif finish is not None and finish != reason:
+                            err = "conflicting finish_reason"
+                        else:
+                            finish = reason
                     dl = ch.get("delta") or {}
                     piece = (dl.get("content") or "") + (dl.get("reasoning_content") or "")
                     if piece:
@@ -164,23 +177,33 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
                             first = time.perf_counter() - t0
                         pieces += 1
                         text.append(dl.get("content") or "")
-                if j.get("usage"):
-                    usage = j["usage"]
-                if j.get("timings"):
-                    timings = j["timings"]
+                clean_usage, clean_timings, errors = validated_metrics(j.get("usage"), j.get("timings"))
+                if errors:
+                    err = "; ".join(errors)
+                if j.get("usage") is not None:
+                    usage = clean_usage
+                if j.get("timings") is not None:
+                    timings = clean_timings
     except urllib.error.HTTPError as e:
         err = f"HTTP {e.code}: {e.read()[:200]!r}"
     except Exception as e:                              # noqa: BLE001
         err = repr(e)[:300]
+    if not done and err is None:
+        err = "incomplete SSE stream: missing [DONE]"
+    if finish is None and err is None:
+        err = "incomplete SSE stream: missing finish_reason"
     total = time.perf_counter() - t0
     return {"first": first, "total": total, "text": "".join(text), "usage": usage, "timings": timings, "err": err,
-            "pieces": pieces}
+            "pieces": pieces, "finish_reason": finish}
 
 
 def digest(r: dict) -> dict:
     """The numbers of one request, the engine's own where it reported them."""
-    u, t = r.get("usage") or {}, r.get("timings") or {}
-    gen = u.get("completion_tokens") or r.get("pieces") or 0
+    u, t, errors = validated_metrics(r.get("usage"), r.get("timings"))
+    err = r.get("err") or ("; ".join(errors) if errors else None)
+    gen = u.get("completion_tokens")
+    if gen is None:
+        gen = t.get("predicted_n")
     prompt_tokens = u.get("prompt_tokens")
     cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
     if cached is None:
@@ -189,13 +212,12 @@ def digest(r: dict) -> dict:
     if read is None and prompt_tokens is not None and cached is not None:
         read = prompt_tokens - cached
     dec, dsrc = t.get("predicted_per_second"), "engine"
-    if dec is None and r.get("first") is not None and gen > 1 and r["total"] > r["first"]:
-        dec, dsrc = round((gen - 1) / (r["total"] - r["first"]), 1), "client"
+    # SSE chunks can contain multiple tokens: chunk arrival times do not establish decode speed.
     pp, psrc = t.get("prompt_per_second"), "engine"
     if pp is None:
         pp, psrc = None, None
-    return {"ok": r.get("err") is None and r.get("first") is not None,
-            "err": r.get("err"), "ttft_s": None if r.get("first") is None else round(r["first"], 3),
+    return {"ok": err is None and r.get("first") is not None,
+            "err": err, "finish_reason": r.get("finish_reason"), "ttft_s": None if r.get("first") is None else round(r["first"], 3),
             "total_s": round(r["total"], 3), "prompt_tokens": prompt_tokens, "reused_tokens": cached,
             "read_tokens": read, "generated_tokens": gen, "prompt_tps": pp, "prompt_tps_source": psrc,
             "decode_tps": dec, "decode_tps_source": dsrc if dec is not None else None,
@@ -205,10 +227,11 @@ def digest(r: dict) -> dict:
 
 # ----------------------------------------------------------------------------------------------------- statistics
 def stat(values) -> dict | None:
-    v = [x for x in values if isinstance(x, (int, float))]
-    if not v:
+    v = [x for x in values if x is not None]
+    median = measured_median(v)
+    if median is None:
         return None
-    return {"median": round(statistics.median(v), 3), "min": round(min(v), 3), "max": round(max(v), 3), "n": len(v)}
+    return {"median": round(median, 3), "min": round(min(v), 3), "max": round(max(v), 3), "n": len(v)}
 
 
 def fmt(s, digits=1, unit="") -> str:
@@ -278,7 +301,8 @@ class Suite:
         good = [r for r in rows if r["ok"]]
         self.out["chat"] = {"requests": rows, "decode_tps": stat(r["decode_tps"] for r in good),
                             "ttft_s": stat(r["ttft_s"] for r in good), "generated_tokens": stat(r["generated_tokens"] for r in good),
-                            "prompt_tokens": stat(r["prompt_tokens"] for r in good)}
+                            "prompt_tokens": stat(r["prompt_tokens"] for r in good),
+                            "reused_tokens": stat(r["reused_tokens"] for r in good)}
 
     def run_prompt(self, tokens: int, label: str):
         if self.ctx and tokens + LONG_MAX_TOKENS + 256 > self.ctx:
@@ -295,13 +319,13 @@ class Suite:
                 self.fail(label, d)
             else:
                 self.log(f"  run {run + 1}: {d['prompt_tokens']} tokens, prompt {d['prompt_tps']} tok/s "
-                         f"({d['reused_tokens'] or 0} reused), first token {d['ttft_s']} s")
+                         f"({d['reused_tokens']} reused), first token {d['ttft_s']} s")
         good = [r for r in rows if r["ok"]]
         self.out["prompts"][label] = {"target_tokens": tokens, "requests": rows,
                                       "prompt_tps": stat(r["prompt_tps"] for r in good),
                                       "ttft_s": stat(r["ttft_s"] for r in good),
                                       "prompt_tokens": stat(r["prompt_tokens"] for r in good),
-                                      "reused_tokens": stat(r["reused_tokens"] or 0 for r in good)}
+                                      "reused_tokens": stat(r["reused_tokens"] for r in good)}
 
     def agent_files(self) -> list[tuple[str, str]]:
         """Five pieces of text a coding agent would read: this folder's own documents when they exist (nothing personal),
@@ -354,15 +378,25 @@ class Suite:
                     self.log(f"  run {run + 1} turn {d['turn']}: prompt {d['prompt_tokens']}, reused {d['reused_tokens']}, "
                              f"read {d['read_tokens']}, first token {d['ttft_s']} s")
         follow = [[d for d in s if d["ok"] and d["turn"] > 0] for s in sessions]
-        hit = [sum(d["reused_tokens"] or 0 for d in s) / max(1, sum(d["prompt_tokens"] or 0 for d in s)) * 100
-               for s in follow if s]
-        # earlier conversation read again: what the previous turn held (prompt + its reply) minus what this turn reused
-        reread, fresh = [], []
-        for s in sessions:
-            s = [d for d in s if d["ok"]]
-            reread.append(sum(max(0, (p["prompt_tokens"] or 0) + (p["generated_tokens"] or 0) - (d["reused_tokens"] or 0))
-                              for p, d in zip(s, s[1:])))
-            fresh.append(sum(d["read_tokens"] or 0 for d in s[1:]) - reread[-1])
+        hit, reread, fresh = [], [], []
+        for session in sessions:
+            # Whole-session totals require every turn and each input count.
+            if len(session) != AGENT_TURNS + 1 or not all(d["ok"] for d in session):
+                continue
+            followups = session[1:]
+            if all(d["reused_tokens"] is not None and d["prompt_tokens"] is not None for d in followups):
+                total_prompt = sum(d["prompt_tokens"] for d in followups)
+                if total_prompt > 0:
+                    ratio = measured_ratio(sum(d["reused_tokens"] for d in followups), total_prompt)
+                    hit.append(ratio * 100 if ratio is not None else None)
+            pairs = list(zip(session, followups))
+            if all(p["prompt_tokens"] is not None and p["generated_tokens"] is not None
+                   and d["reused_tokens"] is not None for p, d in pairs):
+                repeated = sum(max(0, p["prompt_tokens"] + p["generated_tokens"] - d["reused_tokens"])
+                               for p, d in pairs)
+                reread.append(repeated)
+                if all(d["read_tokens"] is not None for d in followups):
+                    fresh.append(sum(d["read_tokens"] for d in followups) - repeated)
         self.out["agent"] = {"sessions": sessions, "hit_pct": stat(hit), "reread_tokens": stat(reread), "new_tokens": stat(fresh),
                              "turn_ttft_s": stat(d["ttft_s"] for s in follow for d in s),
                              "last_turn_prompt_tokens": stat(s[-1]["prompt_tokens"] for s in follow if s),
@@ -376,20 +410,36 @@ class Suite:
             res: dict = {}
             th = []
             t0 = time.perf_counter()
+            def request(i):
+                messages = [{"role": "user", "content": serve_load.prompt_for(i, 400, f" {self.tag('b', n, rd)}")}]
+                res[i] = digest(chat(self.base, self.key, messages, BURST_MAX_TOKENS, self.think))
+
             for i in range(n):
-                t = threading.Thread(target=serve_load.one, args=(self.base, self.key, "strata", i, 400, BURST_MAX_TOKENS, res, {},
-                                                                 self.think, f" {self.tag('b', n, rd)}"))
+                t = threading.Thread(target=request, args=(i,))
                 t.start()
                 th.append(t)
             for t in th:
                 t.join()
             wall = time.perf_counter() - t0
-            toks = sum(r["tokens"] for r in res.values())
-            errs = [r["err"] for r in res.values() if r["err"]]
-            rows.append({"round": rd, "wall_s": round(wall, 2), "tokens": toks, "total_tps": round(toks / wall, 2),
-                         "first_s": [r["first"] for r in res.values() if r["first"] is not None],
-                         "latency_s": [r["total"] for r in res.values()], "errors": errs[:3], "error_count": len(errs)})
-            self.log(f"  round {rd + 1}: {toks} tokens in {wall:.1f} s = {toks / wall:.1f} tok/s total"
+            errs = [r["err"] or "no token came back" for r in res.values() if not r["ok"]]
+            if len(res) != n:
+                errs.append("missing client result")
+            known = not errs and all(r["generated_tokens"] is not None for r in res.values())
+            toks = sum(r["generated_tokens"] for r in res.values()) if known else None
+            tps = measured_ratio(toks, wall)
+            if known and tps is None:
+                errs.append("aggregate token count or throughput is not representable")
+                if not finite_nonnegative(toks):
+                    toks = None
+            if tps is not None:
+                tps = round(tps, 2)
+            for error in errs:
+                self.fail("clients", {"err": error})
+            rows.append({"round": rd, "wall_s": round(wall, 2), "tokens": toks, "total_tps": tps,
+                         "first_s": [r["ttft_s"] for r in res.values() if r["ok"]],
+                         "latency_s": [r["total_s"] for r in res.values() if r["ok"]],
+                         "errors": errs[:3], "error_count": len(errs)})
+            self.log(f"  round {rd + 1}: {toks} tokens in {wall:.1f} s = {tps} tok/s total"
                      + (f"  ERRORS {errs[:1]}" if errs else ""))
         firsts = [x for r in rows for x in r["first_s"]]
         lats = [x for r in rows for x in r["latency_s"]]
@@ -875,7 +925,7 @@ def results_table(out: dict) -> list[str]:
              "| --- | ---: | ---: | ---: | ---: | --- | --- | --- |"]
     c = out["chat"]
     if c:
-        lines.append(row("short chat", fmt(c.get("prompt_tokens"), 0), "0", fmt(c.get("generated_tokens"), 0),
+        lines.append(row("short chat", fmt(c.get("prompt_tokens"), 0), fmt(c.get("reused_tokens"), 0), fmt(c.get("generated_tokens"), 0),
                          (c.get("ttft_s") or {}).get("n", 0), "not measured", fmt(c.get("decode_tps")), fmt(c.get("ttft_s"), 2)))
     for k, v in out["prompts"].items():
         lines.append(row(f"{k} prompt, fresh", fmt(v.get("prompt_tokens"), 0), fmt(v.get("reused_tokens"), 0), str(LONG_MAX_TOKENS) + " cap",
@@ -936,7 +986,7 @@ def render_readme(res: dict) -> str:
           "latency over all requests", "",
           "## Results", ""]
     L += results_table(out)
-    L += ["", "Ranges are the lowest and highest of the runs; `Runs` counts requests that returned a token."]
+    L += ["", "Ranges are the lowest and highest of the runs; `Runs` counts completed requests that returned content or reasoning."]
     ag = out["agent"]
     if ag and ag.get("sessions"):
         L += ["", "### Agent session (conversation cache)", "",
@@ -1000,7 +1050,7 @@ def write_results(res: dict, parent: Path, red, log_lines: list[str]) -> Path:
     d.mkdir(parents=True)
     clean = redact_obj(res, red)
     (d / "results.json").write_text(json.dumps(clean, indent=1, ensure_ascii=False), encoding="utf-8")
-    (d / "README.md").write_text(red(render_readme(res)), encoding="utf-8")
+    (d / "README.md").write_text(render_readme(clean), encoding="utf-8")
     if log_lines:
         (d / "engine-log-excerpt.txt").write_text(red("\n".join(log_lines)) + "\n", encoding="utf-8")
     return d
@@ -1119,7 +1169,7 @@ def main(argv=None) -> int:
             f"or paste README.md into a GitHub issue. Home folders, user and host names and IP addresses are already replaced; "
             f"read it once before you share it.")
         say("For results other people can compare with, run the standard benchmark: strata bench run (docs/BENCHMARK_PROTOCOL.md).")
-        return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
+        return 1 if out["failures"] else 0
     finally:
         if started:
             stop_server(proc)

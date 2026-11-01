@@ -78,7 +78,12 @@ def redactor(key: str = ""):
 
 def redact_object(value, clean):
     if isinstance(value, dict):
-        return {clean(k) if isinstance(k, str) else k: redact_object(v, clean) for k, v in value.items()}
+        # Preserve schema keys even when a username matches one (for example "content").
+        # A role is an API enum, not a person's name. Free text (including content)
+        # still goes through the privacy filter even when it matches that enum.
+        roles = ("system", "developer", "user", "assistant", "tool", "function")
+        return {k: v if k == "role" and isinstance(v, str) and v in roles
+                else redact_object(v, clean) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_object(v, clean) for v in value]
     return clean(value) if isinstance(value, str) else value
