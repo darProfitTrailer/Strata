@@ -541,8 +541,19 @@ private:
     }
     // the slot to give up (or a free one): the policy's lowest among the unpinned, not visible, ready ones.  mu_ held.
     int take_slot(bool demand) {
+        // Failed reads/puts can be free while demand waiters still own pins.
+        auto available = [](const Slot& sp) {
+            return sp.state.load(std::memory_order_acquire) == kFree && sp.pin == 0 && !sp.visible;
+        };
         for (size_t i = free_hint_; i < nalloc_; ++i)
-            if (slots_[i].state.load(std::memory_order_acquire) == kFree) {
+            if (available(slots_[i])) {
+                free_hint_ = i + 1;
+                return (int) i;
+            }
+        // finish() can free a slot behind the hint. Recover it before growing
+        // or evicting, keeping the existing suffix-first allocation order.
+        for (size_t i = 0; i < std::min(free_hint_, nalloc_); ++i)
+            if (available(slots_[i])) {
                 free_hint_ = i + 1;
                 return (int) i;
             }
@@ -554,7 +565,7 @@ private:
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                 try_ready(sp);
                 if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
-                if (sp.state.load(std::memory_order_acquire) == kFree) {
+                if (available(sp)) {
                     free_hint_ = std::min(free_hint_, i);
                     return (int) i;
                 }

@@ -48,7 +48,14 @@ int main(int argc, char** argv) {
     cfg.threads = std::getenv("STORE_TEST_THREADS") ? std::atoi(std::getenv("STORE_TEST_THREADS")) : 8;
     cfg.policy = (ExpertStore::Policy) policy;
     cfg.floor_bytes = 4ull << 30;
+#if defined(_WIN32)
     cfg.ram_avail = [] { return os::ram_avail(); };
+#elif defined(__linux__)
+    cfg.ram_avail = []() -> uint64_t {
+        const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+        return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : ~uint64_t{0};
+    };
+#endif
     if (!st.init(cfg, {geo}, {dfd}, {pfd})) {
         std::printf("init failed\n");
         return 2;
@@ -59,6 +66,8 @@ int main(int argc, char** argv) {
     auto pick = [&] { return rng() % 100 < 70 ? (int) (rng() % 64) : (int) (rng() % 384); };
     std::vector<uint8_t> ref(mb);
     int bad = 0;
+    long failed_demands = 0;
+    long expected_checked = 0;
     long checked = 0;
     const auto t0 = std::chrono::steady_clock::now();
     for (int a = 0; a < n_acc; ++a) {
@@ -69,13 +78,16 @@ int main(int argc, char** argv) {
                 if (es[j] == es[i]) es[i] = (es[i] + 1 + j) % 384;
         }
         std::vector<char> ok;
-        st.ensure(0, es, 6, ok);
+        const bool all = st.ensure(0, es, 6, ok);
+        for (int i = 0; i < 6; ++i) failed_demands += !ok[(size_t) i];
+        if (!all && std::all_of(ok.begin(), ok.end(), [](char v) { return v != 0; })) ++failed_demands;
+        if (a % 17 == 0 && !std::getenv("STORE_TEST_NOCMP")) expected_checked += 18;
         if (a % 17 == 0 && !std::getenv("STORE_TEST_NOCMP"))   // a sample compared with the file read plainly
             for (int i = 0; i < 6; ++i)
                 if (ok[(size_t) i])
                     for (int r = 0; r < 3; ++r) {
                         const int s = st.find(0, es[i]);
-                        os::pread_full(fd, ref.data(), mb, offs[r] + (uint64_t) es[i] * mb);
+                        if (!os::pread_full(fd, ref.data(), mb, offs[r] + (uint64_t) es[i] * mb)) ++bad;
                         ++checked;
                         if (s < 0 || std::memcmp(st.mat(s, r), ref.data(), mb) != 0) ++bad;
                     }
@@ -87,12 +99,15 @@ int main(int argc, char** argv) {
         st.cancel_stale(0);
         int es[6] = {5 + round, 17, 200, 201, 202, 250 + round};
         std::vector<char> ok;
-        st.ensure(0, es, 6, ok);
+        const bool all = st.ensure(0, es, 6, ok);
+        for (int i = 0; i < 6; ++i) failed_demands += !ok[(size_t) i];
+        if (!all && std::all_of(ok.begin(), ok.end(), [](char v) { return v != 0; })) ++failed_demands;
+        expected_checked += 18;
         for (int i = 0; i < 6; ++i)
             if (ok[(size_t) i]) {
                 const int sl = st.find(0, es[i]);
                 for (int r = 0; r < 3; ++r) {
-                    os::pread_full(fd, ref.data(), mb, offs[r] + (uint64_t) es[i] * mb);
+                    if (!os::pread_full(fd, ref.data(), mb, offs[r] + (uint64_t) es[i] * mb)) ++bad;
                     ++checked;
                     if (sl < 0 || std::memcmp(st.mat(sl, r), ref.data(), mb) != 0) ++bad;
                 }
@@ -108,5 +123,6 @@ int main(int argc, char** argv) {
                 "compared %ld matrices, %d differ\n",
                 n_acc, dt, (long long) s.hits.load(), (long long) s.misses.load(), (long long) s.evictions.load(), (long long) s.fails.load(),
                 s.bytes_read.load() / 1e9, s.bytes_read.load() / 1e9 / dt, s.wait_ns.load() / 1e9, checked, bad);
-    return bad == 0 ? 0 : 1;
+    std::printf("failed demands %ld; checked %ld / %ld expected matrices\n", failed_demands, checked, expected_checked);
+    return bad == 0 && failed_demands == 0 && checked == expected_checked ? 0 : 1;
 }
