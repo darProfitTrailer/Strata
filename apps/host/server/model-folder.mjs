@@ -86,7 +86,11 @@ export function rememberDataFolder(file, folder, at = Date.now() / 1000, touch =
   } catch { return false; }
 }
 
-const same = (a, b) => resolve(a).toLowerCase() === resolve(b).toLowerCase();
+const same = (a, b) => {
+  const left = resolve(a), right = resolve(b);
+  // Match Control's normcase rule: Windows folds case, POSIX paths keep it.
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+};
 
 /**
  * One models folder for the app and the Terminal. The app keeps its choice in its own settings file (`appFile`), the Terminal in `terminalFile`;
