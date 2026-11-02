@@ -1,6 +1,7 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/native_cpu_support.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -140,9 +141,10 @@ bool cpu_avx512bw_ok() {
     return ok;
 }
 
-bool cpu_avx2_ok() {
+// Raw OS-aware hardware checks also protect ggml-cpu's compiled ISA. STRATA_FORCE_ISA only caps
+// Strata's own dispatch and must not make a compatible ggml build look incompatible in parity tests.
+static bool cpu_avx2_hardware_ok() {
     static const bool ok = [] {
-        if (cpu_isa_cap() < 2) return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
 #if defined(_MSC_VER)
@@ -175,11 +177,12 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
-bool cpu_avx1_ok() {
+bool cpu_avx2_ok() { return cpu_isa_cap() >= 2 && cpu_avx2_hardware_ok(); }
+
+static bool cpu_avx1_hardware_ok() {
     // AVX (Sandy Bridge, 2011): AVX + OSXSAVE with the OS saving the YMM state; FMA, F16C and AVX2 not needed.
     // From the Strata_Dirigo fork (rwkeyes).
     static const bool ok = [] {
-        if (cpu_isa_cap() < 1) return false;
         unsigned r[4] = {0, 0, 0, 0};
 #if defined(_MSC_VER)
         int x[4];
@@ -202,6 +205,8 @@ bool cpu_avx1_ok() {
     }();
     return ok;
 }
+
+bool cpu_avx1_ok() { return cpu_isa_cap() >= 1 && cpu_avx1_hardware_ok(); }
 
 bool cpu_sse42_ok() {
     static const bool ok = [] {
@@ -228,6 +233,25 @@ const char* isa_floor_build() {
 #else
     return "";
 #endif
+}
+
+bool native_cpu_supported(std::string& err) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    const char* floor = isa_floor_build();
+    const NativeCpuIsaFloor required = std::strcmp(floor, "avx") == 0 ? NativeCpuIsaFloor::Avx
+        : std::strcmp(floor, "sse4.2") == 0 ? NativeCpuIsaFloor::Sse42 : NativeCpuIsaFloor::Avx2;
+    if (!native_cpu_floor_supported(required, cpu_avx2_hardware_ok(), cpu_avx1_hardware_ok(), cpu_sse42_ok())) {
+        const char* name = required == NativeCpuIsaFloor::Avx2 ? "AVX2 with FMA and F16C"
+            : required == NativeCpuIsaFloor::Avx ? "AVX with OS YMM support" : "SSE4.2 with POPCNT";
+        err = "this engine's ggml-cpu requires " + std::string(name) + ", which this CPU (" + cpu_name() +
+              ") does not support. Use a matching engine; CPUs with SSE4.2 and POPCNT can try an experimental "
+              "source build with STRATA_ISA_FLOOR=none (STRATA_PORTABLE=OFF).";
+        return false;
+    }
+#else
+    (void) err; // Non-x86 backends retain their existing NEON/portable path.
+#endif
+    return true;
 }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)

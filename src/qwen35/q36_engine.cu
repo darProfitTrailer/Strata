@@ -3793,8 +3793,16 @@ int strata::qwen35::run(int argc, char** argv) {
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
-    Model m;
     std::string err;
+#if defined(STRATA_Q36_CPU_POOL)
+    // The family switch returns here before generate.cpp's ordinary CPU guard. Check before load()
+    // allocates GPU memory or native_fmt() initializes a potentially wider-ISA ggml-cpu.
+    if (!strata::kernels::cpu::native_cpu_supported(err)) {
+        std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+        return 2;
+    }
+#endif
+    Model m;
     try {
         if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
     } catch (const std::exception& e) {
