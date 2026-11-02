@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, parse, resolve } from 'node:path';
+import { dirname, join, parse, resolve, win32, posix } from 'node:path';
 
 export const isDriveRoot = path => { const p = resolve(path); return p === parse(p).root; };
 
@@ -109,4 +109,19 @@ export function syncDataFolder({ appFile, terminalFile, app = null, exists = pat
   }
   if (!same(mine.folder, theirs.folder)) { rememberDataFolder(terminalFile, mine.folder, mine.at); return { folder: mine.folder, from: 'app' }; }
   return { folder: mine.folder, from: null };
+}
+
+/** Recover preparation folders from a saved native file without resolving relative or traversal paths.
+ * Windows models/Models are the same folder; POSIX names retain their case. This does not register files. */
+export function nativeModelFolders(file, { platform = process.platform, exists = existsSync } = {}) {
+  const paths = platform === 'win32' ? win32 : posix;
+  if (typeof file !== 'string' || file.includes('\0') || !paths.isAbsolute(file)
+      || file.split(platform === 'win32' ? /[\\/]/ : /\//).includes('..')) return {};
+  // A rooted Windows path without a drive is relative to the current drive, not a saved absolute location.
+  if (platform === 'win32' && !/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/i.test(file)) return {};
+  const folder = paths.dirname(file), models = paths.dirname(folder);
+  const name = paths.basename(models);
+  if ((platform === 'win32' ? name.toLowerCase() : name) === 'models')
+    return { dataFolder: paths.dirname(models) };
+  return exists(file) ? { ownGgufDir: folder } : {};
 }

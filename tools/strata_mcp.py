@@ -2030,6 +2030,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                          "description": "auto (default), cuda = NVIDIA, hip = AMD on Linux (experimental)"},
              "low_ram": {"type": "string", "enum": ["auto", "on", "off", "resident", "mmap"],
                          "description": "setup's low-RAM mode (default auto)"},
+             "mtp": {"type": "string", "enum": ["on", "off"],
+                     "description": "Flash-Next on Windows/Linux: explicitly enable or disable the draft layer. "
+                                    "Off uses less memory but generates more slowly. Omit to preserve setup behavior."},
              "port": {**port, "description": "the port the model will listen on (default 8080)"},
              "data_dir": {"type": "string", "maxLength": 260,
                           "description": "where the model files go (default: the Strata-data folder next to the "
@@ -2250,7 +2253,7 @@ class Tools:
 
     def strata_install(self, family=None, model=None, context=None, vision=None, kv=None, gpu=None, gpus=None,
                        backend=None, low_ram=None, port=None, data_dir=None, confirm=False, cancel=False,
-                       gguf_dir=None) -> dict:
+                       gguf_dir=None, mtp=None) -> dict:
         s = self.s
         with s.lock:
             job = s.install_job()
@@ -2274,7 +2277,7 @@ class Tools:
                                       if job.get("download") else ""),
                         "install": job, "follow": "call strata_install again for progress, or strata_logs "
                                                   "source=setup for the full output"}
-            given = [x for x in (family, model, context, vision, kv, gpu, gpus, backend, low_ram, port, data_dir)
+            given = [x for x in (family, model, context, vision, kv, gpu, gpus, backend, low_ram, port, data_dir, gguf_dir, mtp)
                      if x is not None]
             if job and not given and not confirm:
                 return {"summary": f"the last install {job['result']}" + (f": {job['error']}" if job.get("error") else ""),
@@ -2283,7 +2286,7 @@ class Tools:
                                 "fix the problem above and call strata_install again with confirm=true (finished "
                                 "steps are skipped)"}
             plan, args = self.install_plan(family, model, context, vision, kv, gpu, gpus, backend, low_ram, port,
-                                           data_dir, gguf_dir)
+                                           data_dir, gguf_dir, mtp)
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
                 raise ToolError("Strata is running (started by strata_start): stop it first with strata_stop - setup "
@@ -2297,7 +2300,9 @@ class Tools:
                 raise ToolError(plan["disk_short"])
             return self.launch_install(plan, args)
 
-    def install_plan(self, family, model, context, vision, kv, gpu, gpus, backend, low_ram, port, data_dir, gguf_dir=None):
+    def install_plan(self, family, model, context, vision, kv, gpu, gpus, backend, low_ram, port, data_dir, gguf_dir=None, mtp=None):
+        if mtp is not None and mtp not in ("on", "off"):
+            raise ToolError("mtp must be on or off")
         s = self.s
         models, families, contexts, _src = s.tables()
         if gpu is not None and gpus is not None:
@@ -2326,6 +2331,8 @@ class Tools:
             raise ToolError(f"{families[family]['title']} has no {model}; its sizes: {', '.join(sizes)}")
         md = s.own_size(family, model) or models[model]   # Qwen3.6-35B-A3B: its sizes are not in setup's MODELS
         mac = bool(hw.get("mac"))
+        if mtp is not None and (mac or md.get("multi_file") or s.own_families().get(family)):
+            raise ToolError("mtp on/off is supported only for Flash-Next setup on Windows/Linux")
         if mac:                                         # a Mac: no card to pick, no KV choice, no RAM mode: unified memory decides
             if rec.get("model") is None and model is not None and s.mac() and hw.get("ram_gb", 0) < s.mac().MIN_STREAM_RAM_GB:
                 raise ToolError(f"{model} does not fit this Mac: {rec['why']}")
@@ -2377,7 +2384,7 @@ class Tools:
             args += ["--experimental-speed-projection", "off"]
         own = bool(s.own_families().get(family))
         for flag, v in (("--kv", kv), ("--gpu", gpu), ("--gpus", gpus), ("--low-ram", low_ram), ("--port", port),
-                        ("--data-dir", str(target) if data_dir else None)):
+                        ("--data-dir", str(target) if data_dir else None), ("--mtp", mtp)):
             if own and flag in ("--kv", "--low-ram"):      # Flash-Next settings: Qwen3.6's engine path does not use them (setup would warn)
                 continue
             if v is not None:

@@ -312,6 +312,33 @@ class Validation(FakeRoot):
         self.assertEqual(res["plan"]["images"], "yes")
         self.assertRejected("strata_install", {"vision": "yes\nrm"}, "control characters")
 
+    def test_install_mtp_is_explicit_and_reaches_setup_arguments(self):
+        base = ["qwen", "IQ3_S", 32768, "no", None, None, None, None, None, None, None]
+        expected = ["--yes", "--no-start", "--family", "qwen", "--model", "IQ3_S",
+                    "--context", "32768", "--vision", "no", "--experimental-speed-projection", "off"]
+        self.assertEqual(self.tools.install_plan(*base)[1], expected)
+        for mtp in ("on", "off"):
+            with self.subTest(mtp=mtp):
+                self.assertEqual(self.tools.install_plan(*base, mtp=mtp)[1], expected + ["--mtp", mtp])
+                with mock.patch.object(self.tools, "launch_install", return_value={"launched": True}) as launch:
+                    result = self.tools.call("strata_install", dict(family="qwen", model="IQ3_S", context=32768,
+                                                                  vision="no", mtp=mtp, confirm=True))
+                self.assertEqual(result, {"launched": True})
+                self.assertEqual(launch.call_args.args[1], expected + ["--mtp", mtp])
+        for invalid in ("auto", "off --bad", False, 0):
+            self.assertRejected("strata_install", {"mtp": invalid}, "mtp")
+            with self.assertRaisesRegex(M.ToolError, "mtp must be on or off"):
+                self.tools.install_plan(*base, mtp=invalid)
+
+    def test_explicit_mtp_or_local_folder_replans_after_failed_job(self):
+        failed = {"running": False, "result": "failed", "error": "synthetic preparation failure", "exit_code": 1}
+        with mock.patch.object(self.strata, "install_job", return_value=failed):
+            self.assertIn("install", self.tools.strata_install())
+            for options in ({"mtp": "off"}, {"gguf_dir": str(self.root)}):
+                result = self.tools.call("strata_install", options)
+                self.assertIn("plan", result)
+            self.assertIn("--mtp off", self.tools.strata_install(mtp="off")["plan"]["setup_command"])
+
     def test_amd_vision_follows_the_picture_rule(self):
         """Owner rule 2026-10-18: pictures are on for AMD too, on Linux and Windows (setup picks the reader: CPU under 24 GB, GPU from 24 GB)."""
         for win in (False, True):
@@ -652,6 +679,20 @@ class Helpers(unittest.TestCase):
         self.assertEqual(plan["model"], "UD-Q4_K_XL")
         with self.assertRaises(M.ToolError):
             M.Tools(s).install_plan("qwen36", "IQ3_S", 32768, "no", None, None, None, None, None, None, None)
+
+    def test_install_mtp_rejects_paths_that_do_not_apply_the_option(self):
+        s = M.Strata(HERE.parent)
+        hw = {"ram_gb": 512.0, "gpus": [{"index": 0, "name": "fake", "vram_gb": 24.0,
+                                        "usable": True, "vendor": "nvidia"}], "cpu": {"avx2": True}}
+        s.hardware = lambda fresh=False: hw
+        s.disk_free = lambda p: 1000.0
+        for family, model, mac in (("qwen36", "UD-Q4_K_XL", False),
+                                   ("deepseek41", "UD-Q8_K_XL", False), ("qwen", "Q2_0", True)):
+            hw["mac"] = mac
+            for mtp in ("on", "off"):
+                with self.subTest(family=family, mtp=mtp), self.assertRaisesRegex(M.ToolError, "Flash-Next"):
+                    M.Tools(s).install_plan(family, model, 32768, "no", None, None, None, None, None,
+                                           None, None, mtp=mtp)
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
