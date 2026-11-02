@@ -72,6 +72,9 @@ from strata_control import dsv41_context
 from strata_control import engine_component
 from strata_control.discovery import in_trash
 from strata_control import user_args
+from strata_control.qwen36_catalog import (ARCHITECTURE as QWEN36_ARCHITECTURE,
+                                          FILE_TEMPLATE as QWEN36_FILE_TEMPLATE,
+                                          FILES as QWEN36_FILES, MODELS as QWEN36_MODELS)
 
 ROOT = Path(__file__).resolve().parent
 # The desktop app runs this installer under Strata Control (its bundled Python, STRATA_CONTROL_INSTALL=1). The source
@@ -628,25 +631,17 @@ MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # (the hybrid mode), and drafts with the file's own MTP block.  Not in FAMILIES (whose entries are Flash-Next files with
 # packs): OWN_PATH_FAMILIES, offered in the same menu and installed by install_own_path.  NVIDIA (CUDA) and AMD (HIP)
 # only: the Intel Arc (SYCL) engine refuses it.
-QWEN36_FILES = {
-    "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf": (22853663008, "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"),
-    "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf": (32611711264, "35fce994cd36104a7dc1bd8a4bdf13778145664c00fdef6773aebc9246e5019c"),
-    "Qwen3.6-35B-A3B-Q8_0.gguf": (37801097504, "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131"),
-    "mmproj-F16.gguf": (899283584, "71f3cbc1f7cc0f30d09d41cfa924c0060827ebc33bf15ace7e86661e856f0160"),
-}
 OWN_PATH_FAMILIES = {
-    "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
+    "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": QWEN36_ARCHITECTURE,
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
                         "Qwen3.8-Flash-Next with the same tokenizer",
-               "hf": hf("unsloth/Qwen3.6-35B-A3B-MTP-GGUF"), "file": "Qwen3.6-35B-A3B-{q}.gguf", "tag": "qwen36-",
+               "hf": hf("unsloth/Qwen3.6-35B-A3B-MTP-GGUF"), "file": QWEN36_FILE_TEMPLATE, "tag": "qwen36-",
                "mmproj_hf": hf("unsloth/Qwen3.6-35B-A3B-MTP-GGUF"), "mmproj": "mmproj-F16.gguf",
                "name": "qwen3.6-35b-a3b", "license": "Apache 2.0: https://huggingface.co/Qwen/Qwen3.6-35B-A3B",
                # RAM: the engine keeps a copy of every expert in RAM when they do not all fit in VRAM (the hybrid mode),
                # so the file's size plus room for the OS and the rest (measured: UD-Q4_K_XL on a 46 GB PC with a 12 GB
                # card, 18.75 GiB of experts pinned)
-               "models": {"UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), the smallest", "ram_gb": 32},
-                          "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic), closer to the full model", "ram_gb": 44},
-                          "Q8_0": {"about": "8-bit, the closest to the full model", "ram_gb": 52}},
+               "models": QWEN36_MODELS,
                "sha256": QWEN36_FILES,
                # the engine's KV cache per context token: 10 attention layers + the MTP block, 2 KV heads x 256, K and
                # V in fp32 (strata-q36)

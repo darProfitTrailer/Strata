@@ -22,7 +22,7 @@ import stat
 import sys
 from pathlib import Path
 
-from strata_control import discovery
+from strata_control import discovery, qwen36_catalog
 from strata_control.doctor import inspect as inspect_components
 from strata_control.gguf_preflight import inspect_metadata, real_model_file
 from strata_control.profiles import ProfileError
@@ -252,7 +252,29 @@ def _gguf_header(path: Path) -> dict:
             "gguf_version": version}
 
 
+def _qwen36_candidate(shards: list[Path]) -> dict | None:
+    """A single official own-engine filename is a hint, never proof of integrity."""
+    if len(shards) != 1:
+        return None
+    path = shards[0]
+    for model in qwen36_catalog.MODELS:
+        name = qwen36_catalog.FILE_TEMPLATE.format(q=model)
+        if path.name != name:
+            continue
+        size, digest = qwen36_catalog.FILES[name]
+        return {"family": "qwen36", "model": model, "basis": "catalog_name_and_size",
+                "expected_bytes": size, "expected_sha256": digest,
+                "expected_expert_types": sorted(qwen36_catalog.EXPERT_TYPES),
+                "expected_tensor_count": None,
+                "setup_args_hint": ["--family", "qwen36", "--model", model,
+                                    "--gguf-dir", str(path.parent)]}
+    return None
+
+
 def _candidate_selection(shards: list[Path]) -> dict | None:
+    own = _qwen36_candidate(shards)
+    if own is not None:
+        return own
     fingerprint_file = ROOT / "data" / "gguf_fingerprints.json"
     try:
         if fingerprint_file.stat().st_size > 128 * 1024:
@@ -345,6 +367,8 @@ ISSUE_WORDS = {
     "unsupported_or_missing_architecture": "this model type is not supported by the Strata engine (add it as a Custom model API with llama-server instead)",
     "unsupported_or_incomplete_tokenizer_metadata": "the file has no usable tokenizer",
     "missing_or_unexpected_expert_quantization": "its quantization is not one Strata knows",
+    "catalog_model_size_mismatch": "the file size does not match the selected catalog model",
+    "catalog_model_architecture_mismatch": "the file architecture does not match its catalog model name",
 }
 # the checker's own sentences about one file, in words
 _REASON_WORDS = (
@@ -825,16 +849,21 @@ def plan_import(raw_path: str) -> dict:
             observed_experts.update(inspected["expert_tensor_types"])
             observed_tensor_count += inspected["tensor_count_scanned"]
             observed_payload += int(inspected.get("payload_bytes_required") or 0)
-            if inspected["architecture"] is not None and inspected["architecture"] != "qwen4exp":
+            if inspected["architecture"] is not None and inspected["architecture"] not in ("qwen4exp", qwen36_catalog.ARCHITECTURE):
                 issues.append(f"{item.name}: unsupported_architecture")
+            elif inspected["architecture"] is not None and metadata["architecture"] is not None and inspected["architecture"] != metadata["architecture"]:
+                issues.append(f"{item.name}: inconsistent_model_architecture")
     if metadata is not None:
-        if metadata["architecture"] != "qwen4exp":
+        if metadata["architecture"] not in ("qwen4exp", qwen36_catalog.ARCHITECTURE):
             issues.append("unsupported_or_missing_architecture")
         if metadata["tokenizer_model"] != "gpt2" or not metadata["tokenizer_tokens_present"] or \
                 not metadata["tokenizer_merges_present"]:
             issues.append("unsupported_or_incomplete_tokenizer_metadata")
     model_dir = shards[0].parent
-    projectors = [_assess_projector(model_dir / n) for n in sorted(ignored_auxiliary)[:8]]
+    own_candidate = _qwen36_candidate(shards)
+    own_architecture = metadata is not None and metadata["architecture"] == qwen36_catalog.ARCHITECTURE
+    # Flash-Next's reader must not make the host request Qwen3.6 vision setup.
+    projectors = [] if own_candidate or own_architecture else [_assess_projector(model_dir / n) for n in sorted(ignored_auxiliary)[:8]]
     messages = list(notes)
     if folder_holds:
         several = len({h.get("folder") for h in folder_holds}) > 1
@@ -847,7 +876,17 @@ def plan_import(raw_path: str) -> dict:
     elif projectors:
         messages.extend(p["plain"] for p in projectors)
     candidate = _candidate_selection(shards)
-    if candidate is None and metadata is not None and not issues:
+    if own_candidate is not None:
+        if metadata is not None and metadata["architecture"] != qwen36_catalog.ARCHITECTURE:
+            issues.append("catalog_model_architecture_mismatch")
+        if len(files) == 1 and files[0]["bytes"] != own_candidate["expected_bytes"]:
+            issues.append("catalog_model_size_mismatch")
+        messages.append("Qwen3.6 local preview checks the catalog name and size, GGUF structure, tokenizer and expert formats. "
+                        "It does not verify SHA-256, engine role/shape support or available memory; those checks remain before adoption. "
+                        "Vision is not enabled by this preview. No files are downloaded or moved.")
+    elif own_architecture:
+        candidate = None                    # never identify Qwen3.6 through a Flash-Next fingerprint
+    if candidate is None and not own_architecture and metadata is not None and not issues:
         candidate = _candidate_by_header(shards, observed_tensor_count, observed_payload, observed_experts)
         if candidate is None:
             candidate = _candidate_by_layout(shards, observed_tensor_count, observed_payload, observed_experts)
