@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+from contextlib import contextmanager
 import sys
 import time
 from pathlib import Path
@@ -36,6 +38,24 @@ add_gguf_py()
 import gguf  # noqa: E402  (the pinned llama.cpp gguf-py, which knows Q2_0 = type 42)
 
 EXPERT_TENSORS = ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
+
+
+@contextmanager
+def phase(label):
+    """Opt-in diagnostics: fixed labels only; never print exception messages or paths."""
+    enabled = os.environ.get("STRATA_MTP_DIAGNOSTICS") == "1"
+    if enabled:
+        print(f"[mtp-pack] begin {label}", flush=True)
+    try:
+        yield
+    except Exception as exc:
+        if enabled:
+            code = exc.errno if isinstance(exc, OSError) else None
+            print(f"[mtp-pack] failed {label} exception={type(exc).__name__} errno={code}", flush=True)
+        raise
+    else:
+        if enabled:
+            print(f"[mtp-pack] done {label}", flush=True)
 
 
 class _Experts:
@@ -139,55 +159,81 @@ def main() -> int:
     ap.add_argument("--check-experts", type=int, default=8, help="experts per tensor used for the error report")
     a = ap.parse_args()
     src = Path(a.src)
-    manifest = json.loads((src / "mtp-manifest.json").read_text())
+    with phase("manifest-read"):
+        manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
-    w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
-    w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
-    w.add_string("strata.mtp.source_sha256", hashlib.sha256(
-        json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
-    w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    with phase("writer-init"):
+        w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
+        w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
+        w.add_string("strata.mtp.source_sha256", hashlib.sha256(
+            json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
+        w.add_string("strata.mtp.expert_format", a.experts)
+        w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
     report = []
-    for t in sorted(manifest, key=lambda t: t["name"]):
+    for tensor_index, t in enumerate(sorted(manifest, key=lambda t: t["name"])):
+        if os.environ.get("STRATA_MTP_DIAGNOSTICS") == "1":
+            print(f"[mtp-pack] tensor-index={tensor_index}", flush=True)
         name, shape = t["name"], t["shape"]
         t0 = time.time()
         if name in EXPERT_TENSORS:
             # Streamed one expert at a time from a read-only view: the fused gate_up tensor alone is 6.7 GB as
             # float32, so it is never materialized whole.
-            raw = np.memmap(src / t["file"], dtype="<u2", mode="r", shape=tuple(shape))
+            with phase("expert-map"):
+                raw = np.memmap(src / t["file"], dtype="<u2", mode="r", shape=tuple(shape))
             x = _Experts(raw)
             if shape[-1] % block:
                 raise ValueError(f"{name}: inner dim {shape[-1]} not a multiple of {block}")
-            parts = [fn(x[e]) for e in range(shape[0])]            # one expert at a time bounds memory
-            blob = np.concatenate(parts)
-            errs = []
-            for e in range(min(a.check_experts, shape[0])):
-                ref = x[e].reshape(-1)
-                got = dequant(a.experts, parts[e], ref.size)
-                errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
+            with phase("expert-quantize"):
+                parts = [fn(x[e]) for e in range(shape[0])]            # one expert at a time bounds memory
+            with phase("expert-concatenate"):
+                blob = np.concatenate(parts)
+            with phase("expert-error-report"):
+                errs = []
+                for e in range(min(a.check_experts, shape[0])):
+                    ref = x[e].reshape(-1)
+                    got = dequant(a.experts, parts[e], ref.size)
+                    errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
             # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
-            w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
+            with phase("expert-add"):
+                w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
             report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
                            "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),
                            "seconds": round(time.time() - t0, 1)})
         elif len(shape) == 1:
-            x = load_bf16(src / t["file"], shape)
-            w.add_tensor(name, x.astype(np.float32))
+            with phase("dense-f32"):
+                x = load_bf16(src / t["file"], shape)
+                w.add_tensor(name, x.astype(np.float32))
             report.append({"tensor": name, "format": "F32", "bytes": x.size * 4})
         else:
-            bf = np.fromfile(src / t["file"], dtype="<u2").reshape(shape)
-            w.add_tensor(name, bf, raw_dtype=gguf.GGMLQuantizationType.BF16)
+            with phase("dense-bf16"):
+                bf = np.fromfile(src / t["file"], dtype="<u2").reshape(shape)
+                w.add_tensor(name, bf, raw_dtype=gguf.GGMLQuantizationType.BF16)
             report.append({"tensor": name, "format": "BF16", "bytes": bf.size * 2})
-        print(f"{name}: {report[-1]['format']} {report[-1]['bytes'] / 1e6:.1f} MB", flush=True)
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
+        display_name = f"tensor-index={tensor_index}" if os.environ.get("STRATA_MTP_DIAGNOSTICS") == "1" else name
+        print(f"{display_name}: {report[-1]['format']} {report[-1]['bytes'] / 1e6:.1f} MB", flush=True)
+    with phase("write-header"):
+        w.write_header_to_file()
+    with phase("write-metadata"):
+        w.write_kv_data_to_file()
+    with phase("write-tensors"):
+        w.write_tensors_to_file()
+    with phase("writer-close"):
+        w.close()
     total = sum(r["bytes"] for r in report)
-    Path(a.out + ".report.json").write_text(json.dumps({"total_bytes": total, "tensors": report}, indent=1))
-    print(f"wrote {a.out}: {total / 1e9:.3f} GB of tensor data")
+    with phase("write-report"):
+        Path(a.out + ".report.json").write_text(json.dumps({"total_bytes": total, "tensors": report}, indent=1))
+    display_out = "MTP output" if os.environ.get("STRATA_MTP_DIAGNOSTICS") == "1" else a.out
+    print(f"wrote {display_out}: {total / 1e9:.3f} GB of tensor data")
     return 0
 
 
 if __name__ == "__main__":
+    if os.environ.get("STRATA_MTP_DIAGNOSTICS") == "1":
+        try:
+            with phase("pack"):
+                result = main()
+        except Exception:
+            # The phase recorded class/errno; a traceback can expose private paths/messages.
+            result = 1
+        sys.exit(result)
     sys.exit(main())

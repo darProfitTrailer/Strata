@@ -965,12 +965,24 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
                 Path(argv[1]).resolve().parent not in ((ROOT / "tools").resolve(), (ROOT / "tools" / "dsv41").resolve()):
             raise acquisition.AcquisitionRefused("the desktop app's installer only runs its bundled preparation tools; "
                                                  + " ".join(argv[:2]))
-    say("  > " + " ".join(str(c) for c in cmd))
     env = dict(os.environ if env is None else env)
     env.setdefault("STRATA_EXIT_WITH_PARENT", "1")     # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
-    r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
-                       stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
-                       text=True, errors="replace")
+    mtp_diagnostics = env.get("STRATA_MTP_DIAGNOSTICS") == "1" and len(cmd) > 1 and \
+        Path(str(cmd[1])).resolve() == (ROOT / "tools" / "mtp_pack.py").resolve()
+    say("  > mtp_pack.py (diagnostics)" if mtp_diagnostics else "  > " + " ".join(str(c) for c in cmd))
+    if mtp_diagnostics:
+        print("[mtp-pack-child] begin", flush=True)
+    try:
+        r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
+                           stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
+                           text=True, errors="replace")
+    except OSError as exc:
+        if mtp_diagnostics:
+            print(f"[mtp-pack-child] spawn-failed exception={type(exc).__name__} errno={exc.errno}", flush=True)
+            raise SystemExit(1) from None
+        raise
+    if mtp_diagnostics:
+        print(f"[mtp-pack-child] returncode={r.returncode}", flush=True)
     if check and r.returncode != 0:
         if quiet and r.stdout:
             say(r.stdout[-4000:])
