@@ -48,6 +48,8 @@ constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
+/// Checks the configured x86 CPU floor before ggml initialization, including the early Qwen3.6 path.
+bool native_cpu_supported(std::string& err);
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
